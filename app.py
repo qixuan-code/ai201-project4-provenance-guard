@@ -6,7 +6,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
 from aggregator import aggregate_confidence
-from audit import log_decision, get_entries
+from audit import log_decision, get_entries, update_entry, get_entry
 from labels import get_label, get_attribution
 from signals.burstiness import compute_burstiness_score
 from signals.perplexity import compute_perplexity_score
@@ -102,9 +102,10 @@ def submit():
         "timestamp": timestamp,
         "attribution": attribution,
         "confidence": round(confidence, 4),
-        "llm_score": s1_raw,
-        "burstiness_score": s2_score,
+        "llm_score": round(s1_raw, 4),
+        "burstiness_score": round(s2_score, 4),
         "status": "classified",
+        "appeal": None,   # populated by POST /appeal; null here means no appeal filed
     })
 
     # ── 7. Response ───────────────────────────────────────────────────────────
@@ -116,6 +117,66 @@ def submit():
         "confidence": round(confidence, 4),
         "signals": signals,
         "label": label,
+    }), 200
+
+
+@app.route("/appeal/<content_id>", methods=["POST"])
+def appeal(content_id):
+    """
+    POST /appeal/<content_id>
+    Creator contests a classification. Captures their reasoning, appends an
+    appeal record to the audit log, and sets status to "under_review".
+    No re-classification occurs (planning.md §4).
+
+    Body:
+        creator_statement  str  required, 10–2000 chars
+        contact_email      str  optional
+    """
+    # ── 1. Validate the content_id exists ────────────────────────────────────
+    original = get_entry(content_id)
+    if original is None:
+        return jsonify({"error": f"No submission found with content_id {content_id!r}"}), 404
+
+    if original.get("status") == "under_review":
+        return jsonify({"error": "An appeal for this submission is already under review"}), 409
+
+    # ── 2. Parse and validate body ───────────────────────────────────────────
+    data = request.get_json(force=True, silent=True) or {}
+    # Accept both field names for compatibility
+    reasoning = (data.get("creator_reasoning") or data.get("creator_statement") or "").strip()
+
+    if len(reasoning) < 10:
+        return jsonify({"error": "creator_reasoning must be at least 10 characters"}), 400
+    if len(reasoning) > 2000:
+        return jsonify({"error": "creator_reasoning must be 2000 characters or fewer"}), 400
+
+    contact_email = data.get("contact_email")
+
+    # ── 3. Write appeal record + update status ───────────────────────────────
+    appeal_id = str(uuid.uuid4())
+    appeal_timestamp = datetime.now(timezone.utc).isoformat()
+
+    updated = update_entry(content_id, {
+        "status": "under_review",
+        "appeal": {
+            "appeal_id": appeal_id,
+            "appeal_timestamp": appeal_timestamp,
+            "creator_reasoning": reasoning,
+            "contact_email": contact_email,
+        },
+    })
+
+    if not updated:
+        # Race condition: entry disappeared between get_entry and update_entry
+        return jsonify({"error": "Failed to update audit log — please retry"}), 500
+
+    # ── 4. Response ───────────────────────────────────────────────────────────
+    return jsonify({
+        "appeal_id": appeal_id,
+        "content_id": content_id,
+        "status": "under_review",
+        "message": "Your appeal has been recorded. A reviewer will examine your submission.",
+        "appeal_timestamp": appeal_timestamp,
     }), 200
 
 
